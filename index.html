@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>スマホで動くAI 実験</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #171717;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --accent: #1f7a4d;
+    --warn: #b45309;
+  }
+  * { box-sizing: border-box; -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    padding: 20px 18px 48px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    line-height: 1.7;
+    max-width: 640px;
+    margin-inline: auto;
+  }
+  h1 { font-size: 19px; margin: 0 0 4px; letter-spacing: .01em; }
+  .lead { font-size: 13px; color: var(--muted); margin: 0 0 20px; }
+  .card {
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .row { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; padding: 4px 0; }
+  .row span:last-child { text-align: right; color: var(--muted); }
+  .val-ok { color: var(--accent); font-weight: 600; }
+  .val-ng { color: var(--warn); font-weight: 600; }
+  button {
+    width: 100%;
+    border: 0;
+    border-radius: 10px;
+    padding: 15px 16px;
+    font-size: 16px;
+    font-weight: 600;
+    font-family: inherit;
+    background: var(--fg);
+    color: #fff;
+    cursor: pointer;
+  }
+  button:disabled { background: #9ca3af; }
+  button.secondary { background: #f3f4f6; color: var(--fg); }
+  .bar { height: 6px; background: #f3f4f6; border-radius: 99px; overflow: hidden; margin: 12px 0 8px; }
+  .bar > i { display: block; height: 100%; width: 0%; background: var(--accent); transition: width .3s; }
+  .status { font-size: 13px; color: var(--muted); min-height: 20px; }
+  textarea {
+    width: 100%;
+    min-height: 78px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 12px;
+    font-size: 16px;
+    font-family: inherit;
+    color: var(--fg);
+    resize: vertical;
+  }
+  .answer {
+    white-space: pre-wrap;
+    font-size: 15px;
+    border-left: 3px solid var(--accent);
+    padding-left: 12px;
+    min-height: 22px;
+    margin-top: 14px;
+  }
+  .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .offline-banner {
+    display: none;
+    background: #ecfdf5;
+    color: #065f46;
+    border: 1px solid #a7f3d0;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 16px;
+  }
+  .offline-banner.show { display: block; }
+</style>
+</head>
+<body>
+  <h1>スマホで動くAI 実験</h1>
+  <p class="lead">読み込みが終わったら、機内モードにして同じ質問をしてみてください。それでも答えれば、AIは端末の中で動いています。</p>
+
+  <div class="offline-banner" id="offlineBanner">オフラインです（通信が切れています）</div>
+
+  <div class="card">
+    <div class="row"><span>通信</span><span id="netState">確認中</span></div>
+    <div class="row"><span>計算方式</span><span id="deviceState">未確定</span></div>
+    <div class="row"><span>モデル</span><span id="modelState">未読み込み</span></div>
+    <div class="bar"><i id="progressBar"></i></div>
+    <div class="status" id="statusText">下のボタンを押すと、AI本体（約480MB）をスマホに保存します。最初の1回だけ通信が必要です。</div>
+    <div style="margin-top:14px">
+      <button id="loadBtn">AIを読み込む</button>
+    </div>
+    <p class="note">2回目以降は、アプリを閉じても保存されたモデルを使い回します（ブラウザのキャッシュを消すと再ダウンロードになります）。</p>
+  </div>
+
+  <div class="card">
+    <textarea id="question" placeholder="例：子どもが描いた絵に、どんな名前をつけたらいい？">子どもが描いた絵を、その子の言葉のまま残したい。どういう残し方がいい？</textarea>
+    <div style="margin-top:12px">
+      <button id="askBtn" disabled>質問する</button>
+    </div>
+    <div class="answer" id="answer"></div>
+    <p class="note" id="speed"></p>
+  </div>
+
+  <p class="note">この実験ページは、AIの賢さを見るものではありません。通信ゼロで推論が動くかどうかだけを見ます。精度は0.5Bモデルなので低いです。</p>
+
+<script type="module">
+const MODEL_ID = "onnx-community/Qwen2.5-0.5B-Instruct";
+const LIB_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.2";
+
+const el = (id) => document.getElementById(id);
+const netState = el("netState");
+const deviceState = el("deviceState");
+const modelState = el("modelState");
+const statusText = el("statusText");
+const progressBar = el("progressBar");
+const loadBtn = el("loadBtn");
+const askBtn = el("askBtn");
+const answer = el("answer");
+const speedEl = el("speed");
+const offlineBanner = el("offlineBanner");
+
+let generator = null;
+
+function refreshNet() {
+  const on = navigator.onLine;
+  netState.textContent = on ? "オンライン" : "オフライン";
+  netState.className = on ? "val-ok" : "val-ng";
+  offlineBanner.classList.toggle("show", !on);
+}
+window.addEventListener("online", refreshNet);
+window.addEventListener("offline", refreshNet);
+refreshNet();
+
+deviceState.textContent = navigator.gpu ? "WASM（CPU／WebGPUも利用可）" : "WASM（CPU）";
+
+loadBtn.addEventListener("click", async () => {
+  loadBtn.disabled = true;
+  loadBtn.textContent = "読み込み中…";
+  progressBar.style.width = "0%";
+
+  let transformers;
+  try {
+    transformers = await import(LIB_URL);
+  } catch (e) {
+    statusText.textContent = "ライブラリの取得に失敗しました。通信状態を確認してください。";
+    loadBtn.disabled = false;
+    loadBtn.textContent = "AIを読み込む";
+    return;
+  }
+  const { pipeline } = transformers;
+
+  const progress_callback = (p) => {
+    if (p.status === "progress" && typeof p.progress === "number") {
+      const pct = Math.round(p.progress);
+      progressBar.style.width = pct + "%";
+      statusText.textContent = `${p.file || "モデル"} を読み込み中… ${pct}%`;
+    } else if (p.status === "done") {
+      statusText.textContent = `${p.file || "ファイル"} 完了`;
+    } else if (p.status === "ready") {
+      statusText.textContent = "準備完了";
+    }
+  };
+
+  try {
+    deviceState.textContent = "WASM（CPU）";
+    generator = await pipeline("text-generation", MODEL_ID, {
+      device: "wasm",
+      dtype: "q4",
+      progress_callback,
+    });
+    modelState.textContent = "読み込み済み";
+    modelState.className = "val-ok";
+    progressBar.style.width = "100%";
+    statusText.textContent = "準備完了。通信を切ってから質問してみてください。";
+    loadBtn.textContent = "読み込み済み";
+    askBtn.disabled = false;
+  } catch (e) {
+    console.error(e);
+    statusText.textContent = "読み込みに失敗しました：" + (e?.message || e);
+    loadBtn.disabled = false;
+    loadBtn.textContent = "もう一度読み込む";
+  }
+});
+
+askBtn.addEventListener("click", async () => {
+  if (!generator) return;
+  askBtn.disabled = true;
+  answer.textContent = "考えています…";
+  speedEl.textContent = "";
+  const q = el("question").value.trim();
+  const messages = [
+    { role: "system", content: "あなたは短く答えるアシスタントです。日本語で3文以内で答えてください。" },
+    { role: "user", content: q },
+  ];
+  try {
+    const prompt = generator.tokenizer.apply_chat_template(messages, {
+      tokenize: false,
+      add_generation_prompt: true,
+    });
+    const t0 = performance.now();
+    const out = await generator(prompt, {
+      max_new_tokens: 80,
+      do_sample: false,
+      return_full_text: false,
+    });
+    const ms = performance.now() - t0;
+    const text = (out[0]?.generated_text || "").trim();
+    answer.textContent = text || "(空の応答)";
+    const tokens = generator.tokenizer.encode(text).length;
+    speedEl.textContent = `所要 ${(ms / 1000).toFixed(1)}秒 / 約 ${(tokens / (ms / 1000)).toFixed(1)} トークン/秒 / 通信 ${navigator.onLine ? "オン" : "オフ"}`;
+  } catch (e) {
+    console.error(e);
+    answer.textContent = "エラー：" + (e?.message || e);
+  } finally {
+    askBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
